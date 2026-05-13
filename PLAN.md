@@ -83,6 +83,18 @@ Miden has no registered CAIP-2 namespace. We adopt provisional values, documente
 - `miden:testnet`
 - `miden:mainnet` (reserved, unused)
 
+### 4.0 HTTP header names (canonical)
+
+The public buyer↔merchant exchange uses three HTTP headers, base64-of-JSON encoded. Names match x402 v2 as implemented by `x402-rs`:
+
+| Constant | Header | Direction | Carries |
+|---|---|---|---|
+| `PAYMENT_REQUIRED_HEADER`  | `Payment-Required`  | merchant → buyer (`402`)   | `MidenPaymentRequired` |
+| `PAYMENT_SIGNATURE_HEADER` | `Payment-Signature` | buyer → merchant (retry)   | `MidenPaymentPayload` |
+| `PAYMENT_RESPONSE_HEADER`  | `Payment-Response`  | merchant → buyer (`200`)   | `SettleResponse` |
+
+Full step-by-step in [`docs/protocol.md`](./docs/protocol.md). Helpers live in [`miden_x402_types::header`](./crates/miden-x402-types/src/header.rs); the wire-format contract is enforced by [`tests/wire_round_trip.rs`](./crates/miden-x402-types/tests/wire_round_trip.rs).
+
 ### 4.2 `PaymentRequirements` (server → client, inside the 402 body)
 ```json
 {
@@ -157,7 +169,8 @@ miden-x402/
 │   ├── node/                        # TypeScript
 │   └── python/                      # Python (merchant only)
 └── docs/
-    └── scheme_exact_miden.md        # scheme spec, mirrors x402-rs/specs style
+    ├── protocol.md                  # public + back-end HTTP wire contract (M3)
+    └── scheme_exact_miden.md        # scheme spec, mirrors x402-rs/specs style (M6)
 ```
 
 ### 6.1 `crates/miden-x402-types`
@@ -229,10 +242,10 @@ The MVP types crate declares the `Private` variant so Phase 2 is a non-breaking 
 
 ## 9. Milestones / execution order
 
-1. **M1 — Workspace + types.** Cargo workspace; `miden-x402-types` compiling with the structs (including the unimplemented `Private` payload variant) and base64 round-trip tests. No network code.
-2. **M2 — Facilitator core.** `miden-x402-facilitator` lib + bin against testnet RPC; `/verify` and `/supported` working against hand-crafted public P2ID notes created with the Miden CLI.
-3. **M3 — `/settle` parity.** Same checks as `/verify` (idempotent), returns `SettlementResponse`. Header emission contract finalised.
-4. **M4 — Node SDK (merchant + agent) + demo.** Express + Hono middleware; agent wrapper around `@miden-sdk/miden-sdk`; demo merchant and demo agent. Full E2E green.
+1. **M1 — Workspace + types.** ✅ shipped. Cargo workspace; `miden-x402-types` compiling with the structs (including the unimplemented `Private` payload variant) and base64 round-trip tests. No network code.
+2. **M2 — Facilitator core.** ✅ shipped. `miden-x402-facilitator` lib + bin against testnet RPC; `/verify`, `/settle`, `/supported`, `/health` working against a mockable `MidenNode` trait. Live testnet smoke test deferred to M4.
+3. **M3 — Header emission contract.** ✅ shipped. Canonical header names (`Payment-Required`, `Payment-Signature`, `Payment-Response`) + per-type encode/decode helpers in `miden-x402-types`; end-to-end wire round-trip integration test; `docs/protocol.md` codifying the contract for SDK ports. (`/settle` parity was already delivered as part of M2.)
+4. **M4 — Node SDK (merchant + agent) + demo.** Express + Hono middleware; agent wrapper around `@miden-sdk/miden-sdk`; demo merchant and demo agent. Full E2E green against live testnet.
 5. **M5 — Python SDK (merchant only) + demo.** FastAPI + Flask middleware; demo merchant. Cross-language E2E green (Node agent ↔ Python merchant).
 6. **M6 — Docs.** `README.md` with quickstart, `docs/scheme_exact_miden.md` modeled on the `x402-rs` scheme spec template, deployment notes for the facilitator.
 7. **M7 (Phase 2, separate plan) — Private notes.** Extend the facilitator and the SDKs per §7.

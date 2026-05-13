@@ -27,7 +27,12 @@ pub use aliases::{
     MidenPaymentPayload, MidenPaymentRequired, MidenPaymentRequirements, MidenSettleRequest,
     MidenVerifyRequest,
 };
-pub use header::{HeaderError, decode_payment_header, encode_payment_header};
+pub use header::{
+    HeaderError, PAYMENT_REQUIRED_HEADER, PAYMENT_RESPONSE_HEADER, PAYMENT_SIGNATURE_HEADER,
+    decode_payment_header, decode_payment_required_header, decode_payment_response_header,
+    decode_payment_signature_header, encode_payment_header, encode_payment_required_header,
+    encode_payment_response_header, encode_payment_signature_header,
+};
 pub use ids::{AccountIdHex, IdError, NoteIdHex, TransactionIdHex};
 pub use network::{
     MAINNET_REFERENCE, MIDEN_NAMESPACE, TESTNET_REFERENCE, miden_mainnet, miden_testnet,
@@ -40,5 +45,6 @@ pub use scheme::{
 // Re-export the upstream x402 v2 types we share with the rest of the
 // ecosystem, so callers can take a single dep on `miden-x402-types`.
 pub use x402_types::chain::ChainId;
+pub use x402_types::proto::v1::{SettleResponse, VerifyResponse};
 pub use x402_types::proto::v2::{ResourceInfo, X402Version2};
 pub use x402_types::proto::{ErrorReason, PaymentVerificationError};
