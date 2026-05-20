@@ -1,97 +1,164 @@
-## Idea: Guardian as x402 Facilitator (Batched Settlement)
+## Proposed Design: Guardian-as-Facilitator for x402 on Miden
 
-Following the latency discussion in [node#1796](https://github.com/0xMiden/node/issues/1796), I want to float an architectural alternative that I think collapses three roles into the Guardian and changes our competitive position on M2M latency.
+Following @bobbinth's [clarification on in-flight state](https://github.com/0xMiden/protocol/discussions/2919#discussioncomment-16976558), this is a concrete proposal that builds on the [original sketch](https://github.com/0xMiden/protocol/discussions/2919#discussioncomment-16961615) without requiring protocol changes. The goal is sub-second perceived latency for x402 payments on Miden by moving proving off the agent's critical path and into a Guardian-operated facilitator.
 
-### The pattern
+The pattern reuses primitives that already exist (the multisig PoC ships a "sign-without-prove" client and a coordinator that batches and submits) and applies them to the agent-payment shape. No new note types, no new account types, no MASM changes.
 
-Standard x402 on Miden (per [Digine-Labs/miden-x402](https://github.com/Digine-Labs/miden-x402)): agent constructs note, proves locally, submits to network, waits for block inclusion, sends `{note_id, inclusion_proof}` to merchant, merchant verifies via the facilitator. End-to-end ~5-10s, dominated by proving + block time. Settled-at-commit model: a P2ID note in a committed block is the settlement event, and the facilitator is a read-only verifier.
-
-Standard x402 on Base: agent signs an EIP-3009 authorization, facilitator verifies signature, merchant delivers, facilitator settles on-chain async. Sub-second perceived latency, but trust assumption that facilitator submits and merchant delivers.
-
-Proposed pattern: use the Guardian as the x402 facilitator with batched settlement.
-
-The 402 response follows the standard x402 spec structure, with Miden-specific note parameters carried in the `extra` field:
-
-```json
-{
-  "x402Version": 1,
-  "accepts": [
-    {
-      "scheme": "miden-p2id-private",
-      "network": "miden-mainnet",
-      "payTo": "<recipient_account_id>",
-      "asset": "<faucet_id>",
-      "maxAmountRequired": "100000",
-      "resource": "https://api.example.com/premium",
-      "maxTimeoutSeconds": 60,
-      "extra": {
-        "note_tag": "<tag>",
-        "serial_num": "<server_generated>"
-      }
-    }
-  ]
-}
-```
+### Detailed flow
 
 ```
-Agent                Guardian-Facilitator             Merchant
-  |                          |                           |
-  |-- GET /resource ------------------------------------>|
-  |<- 402 (standard x402 with Miden scheme in accepts) --|
-  |                          |                           |
-  | Build private P2ID note  |                           |
-  | + sign tx (NOT proven)   |                           |
-  |                          |                           |
-  |-- Signed unproven note ->|                           |
-  |                          |                           |
-  |       Verify: signature valid, note matches 402,     |
-  |       agent has balance?, mandate satisfied,         |
-  |       input note reserved (nullifier lock)           |
-  |                          |                           |
-  |                          |-- Verification OK ------->|
-  |                          |                           |
-  |<-- Resource delivered -------------------------------|
-  |                          |                           |
-  |                          |<-- Resource delivered ----|
-  |                          |                           |
-  |       Batch with other pending payments              |
-  |       Co-sign + prove batch                          |
-  |       Submit batch to network                        |
+========================================================================
+SETUP (once)
+========================================================================
+
+User creates agent account on Miden with two keys:
+  - hot key (held by agent, used for signing payment txs)
+  - cold key + Guardian co-sig required for any out-of-mandate action
+User signs AP2 mandate, sends to Agentic Guardian
+Agentic Guardian stores mandate, registers agent account
+
+
+========================================================================
+PER-PAYMENT (hot path, target sub-second perceived latency)
+========================================================================
+
+Agent             Agentic Client       Agentic Guardian          Merchant
+  |                     |                     |                     |
+  |-- GET /resource ----------------------------------------------->|
+  |<-- 402 (x402 + Miden scheme in accepts) ------------------------|
+  |                     |                     |                     |
+  | Construct tx        |                     |                     |
+  | against latest      |                     |                     |
+  | pending state       |                     |                     |
+  | Sign with hot key   |                     |                     |
+  |                     |                     |                     |
+  |-- signed unproven tx + 402 context ------>|                     |
+  |                     |                     |                     |
+  |                     |   1. Check initial_state matches latest   |
+  |                     |      pending state for this agent         |
+  |                     |   2. Verify hot-key signature             |
+  |                     |   3. Check tx output: P2ID to merchant,   |
+  |                     |      amount and asset match 402           |
+  |                     |   4. Check AP2 mandate satisfied          |
+  |                     |      (amount cap, merchant allowlist,     |
+  |                     |       time window, daily total)           |
+  |                     |   5. Compute output nullifiers            |
+  |                     |   6. Check none are in reserved_nullifiers|
+  |                     |   7. Reserve nullifiers (WAL persisted)   |
+  |                     |   8. Advance pending state for this agent |
+  |                     |                     |                     |
+  |                     |<-- ack (tx accepted, pending state = X) --|
+  |                     |                     |                     |
+  |                     |        |-- x402 /verify OK -------------->|
+  |                     |        |                                  |
+  |                     |        |<-- 200 OK + resource ------------|
+  |<-- resource ---------------------------------------------------|
+
+
+========================================================================
+BATCH SETTLEMENT (async, off the critical path)
+========================================================================
+
+Agentic Guardian                                              Chain
+  |                                                            |
+  | Every N seconds or M pending txs:                          |
+  |   1. Take snapshot of pending txs across all agents        |
+  |   2. Order them per agent (preserve state-transition order)|
+  |   3. Generate STARK proofs (in parallel, per tx)           |
+  |   4. Assemble batch tx submission                          |
+  |                                                            |
+  |-- submit proven txs -------------------------------------->|
+  |                                                            |
+  |<-- block inclusion confirmation ---------------------------|
+  |                                                            |
+  |   5. Move nullifiers from reserved -> spent                |
+  |   6. Mark pending states as committed                      |
+  |   7. Notify Agentic Clients of commitment                  |
+
+
+========================================================================
+FAILURE RECOVERY
+========================================================================
+
+If batch fails on submission (e.g. one tx invalid):
+  - Identify failing tx, isolate it
+  - Resubmit remaining batch
+  - Release nullifiers reserved by failing tx
+  - Notify Agentic Client of failure for that specific tx
+
+If Agentic Guardian crashes:
+  - Recover reserved_nullifiers from WAL
+  - Recover pending state from persistent store
+  - Replay any in-flight txs not yet committed
 ```
 
-The merchant's trust model here is the same as on Base: trust the facilitator's verification message and deliver. The merchant does not independently verify on-chain inclusion at delivery time. Batch settlement produces an auditable on-chain record post-hoc, useful for accounting and reconciliation but not on the critical path.
+### What changes where
 
-### Why so?
+No Miden protocol changes. No new note types. No new account types. The work splits cleanly into two components.
 
-**Same trust assumptions as Base, better latency profile.** The agent trusts the Guardian (which it already does, by definition of Guardian). The merchant trusts the Guardian to settle (same trust model as trusting Coinbase's CDP facilitator). No new trust assumptions added, one trust assumption reused.
+---
 
-**Proving moves off the critical path.** Steps 1-5 take maybe 200-500ms. Proving and settlement happen asynchronously, amortized across a batch. Per-transaction proving cost drops to 1/N. This is what makes sub-cent micropayments economically viable.
+### 1. `miden-agentic-client`
 
-**Guardian is doing 3 jobs at once.** Mandate enforcement (already), payment verification (new), batch settlement (new). For users who already have a Guardian, the facilitator role comes for free. For Guardian operators, this is a new revenue stream that fits the "custody economics without custody liability" framing of Phase 1b.
+A new client crate (or extension of `miden-client`) that handles the agent-side flow. The reference architecture already exists in [`miden-multisig-client`](https://github.com/0xMiden/MultiSig/tree/main/crates/miden-multisig-client), which implements the same "sign without prove, send to coordinator" pattern for the human multisig case.
 
-**Privacy doesn't degrade.** Guardian sees its users' transactions (it would anyway). Merchant sees `{note_id, inclusion_proof}` post-batch. No facilitator-as-privacy-leak issue that exists when a third party like Coinbase facilitates across all merchants.
+The multisig client is human-paced (collect N-of-M signatures from humans over minutes/hours). The agentic client needs the same architectural shape adapted for machine pace: one signer, sub-second cadence, many concurrent in-flight txs.
 
-### Competition
+What it must do:
 
-Right now our honest benchmark story is "Miden settles privately in 5-10s, Tempo in ~500ms, Base in ~2-4s." That's cool, but we can do better.
+- **Sign-only mode.** Construct a transaction, sign with the agent's hot key, do not prove. Serialize the signed-but-unproven tx for transmission.
+- **Track pending state per agent account.** After sending a signed tx to the Guardian and receiving ack, advance the client's view of the agent's account state. The next tx must be constructed against this pending state, not the on-chain committed state.
+- **Handle multiple in-flight txs.** Bobbin's [clarification](https://github.com/0xMiden/protocol/discussions/2919#discussioncomment-16976558) is the foundational point: as long as the Guardian is the single serialization authority, no forks are possible, so the client can keep building on pending state without risk of invalidation.
+- **Reconcile with on-chain commitment.** When the Guardian reports a tx as committed, mark that state transition as final. If a tx fails, roll back the pending state.
+- **Light footprint.** Agent infrastructure (Crossmint, Skyfire, Payman) should be able to embed this in constrained environments. No proving keys, no kernel execution at runtime, just key management and state tracking.
 
-With Guardian-as-facilitator the story becomes "Miden settles privately with sub-second perceived latency. Faster and more private than base and tempo." That sounds better if we make it happen :).
+Open decision: extend `miden-client` with a sign-only mode, or ship a separate `miden-agentic-client` crate that wraps the core client. The multisig precedent is "separate crate that wraps." Arguments either way:
 
-### Open question
+- *Separate crate:* clear boundaries, doesn't burden core client users with agent-specific state machine
+- *Core integration:* sign-only mode is generally useful (mobile, browser, any constrained signer), agentic-client becomes a thin wrapper that adds the high-throughput pending-state tracking
 
-**1. Nullifier reservation for verify-before-prove.** To prevent the Guardian from verifying two transactions that consume the same input note, the Guardian maintains an in-memory `reserved_nullifiers` set:
+Needs input from @igamigo on which factoring fits the core client roadmap.
 
-- At verify time, compute the nullifiers the note would produce
-- If any are already in the reserved set, reject (agent is trying to double-spend in the pending window)
-- Otherwise add them to the reserved set and continue
-- On batch settlement success, nullifiers move from "reserved" to spent (and are now on-chain via the batch tx)
-- On batch settlement failure or timeout, release the reservations
+---
 
-This is structurally the same mechanism [`EIP-3009`](https://eips.ethereum.org/EIPS/eip-3009) (the basis for `x402`) uses with nonces, just enforced at the Guardian rather than the contract. Since the Guardian co-signs anyway, it's the natural serialization point for the agent's pending transactions.
+### 2. `agentic-guardian` (or extension of OpenZeppelin Guardian)
 
-Does that make sense? (@bobbinth, @partylikeits1983, @ermvrs, @Mirko-von-Leipzig )
+Likely a fork or extension of [OpenZeppelin Guardian](https://github.com/OpenZeppelin/guardian) plus the [coordinator server pattern from the multisig PoC](https://github.com/0xMiden/MultiSig/blob/main/bin/coordinator-server/README.md). The coordinator server is roughly the right shape (Rust/Axum, REST API, PostgreSQL persistence, accepts proposals, batches, submits to network). It needs adapting for the agent-payment workload.
 
-### Plan
-**For the next 4 weeks:** Miden team / Digine Labs operates one Guardian with a facilitator module as the reference implementation. Single endpoint (e.g. `facilitator.miden.io`), branded as Miden. Merchants integrate against it the same way they integrate against Coinbase's CDP.
+What it must do:
 
-**For year 1:** package the facilitator module as a drop-in component that existing x402 facilitator operators (PayAI, Dexter, x402.rs) can integrate to add Miden as a supported chain. They already run facilitator infrastructure across Base, Solana, Polygon. Adding Miden is a module, not a new operation. This is how we get to facilitator diversity without asking anyone to stand up a Guardian.
+- **Accept signed unproven txs.** New endpoint that takes a serialized signed tx, validates the signature against the registered agent's hot key, and queues for batch settlement.
+- **Per-agent pending state tracking.** Maintain the latest acknowledged state for each registered agent account. Reject txs that don't build on the latest pending state for that agent (prevents forks).
+- **Per-agent nullifier reservation DB.** Reserve nullifiers in memory at verify time, persist to WAL for crash recovery, move to spent at commitment. This prevents double-spend in the pending window.
+- **AP2 mandate enforcement.** Per-agent mandate stored. Each incoming tx checked against mandate conditions (amount caps, merchant allowlists, time windows, daily totals). Reject if violated.
+- **Concurrent multi-agent throughput.** Unlike the multisig coordinator which serves one account per proposal, the agentic guardian must handle N independent agents each with multiple concurrent in-flight txs. Lock contention design needs attention.
+- **Batch proving.** Generate STARK proofs for pending txs in parallel and assemble a batch for submission. Proving infrastructure (CPU/GPU) sized for target throughput.
+- **Batch submission and reconciliation.** Submit proven txs, watch for block inclusion, notify clients of commitment or failure.
+- **Crash recovery.** All in-flight state (reserved nullifiers, pending account states, queued txs) must survive a process restart. PostgreSQL + WAL pattern from the coordinator server is a reasonable starting point.
+
+Open decision: extend OZ Guardian directly, or ship as a separate `agentic-guardian` component that integrates with Guardian for custody and mandate verification but handles the high-throughput payment flow itself. The latter is probably cleaner because the operational profiles are different (Guardian: low-frequency high-value custody operations; agentic-facilitator: high-frequency low-value payment flows). Needs input from @bobbinth and OZ team on what fits their architecture.
+
+---
+
+### Why this design works
+
+- **Sub-second perceived latency.** Agent's critical path is sign + send + ack. Proving and on-chain settlement happen asynchronously. Latency budget is dominated by network round-trips (~200-500ms), comparable to Base x402.
+- **No protocol changes.** Stays inside the existing Miden account and note model. The "inverted proving flow" Bobbin described is the only architectural shift, and the primitives already exist in the multisig PoC.
+- **Privacy preserved.** Notes can be private (per Digine-Labs' existing `noteType: "private"` variant). The Guardian sees its registered agents' txs (which it would anyway as co-signer), the merchant sees only what x402 verification needs.
+- **Mandate enforcement composes.** Guardian's per-agent mandate check happens at verify time. AP2 enforcement at the chain layer rather than the merchant layer.
+- **Cleanly reuses existing patterns.** Multisig client for sign-without-prove. Coordinator server for batched async submission. OZ Guardian for custody and mandate. New work is mostly gluing these together and adapting for machine-pace throughput.
+
+### What this comment is for
+
+If the design is acceptable in principle to @bobbinth, @igamigo, @partylikeits1983 and @ermvrs this can serve as the shared baseline for a more detailed implementation design across the four parties. Each component (agentic-client, agentic-guardian, x402 scheme variant, end-to-end testing) can then be scoped and assigned.
+
+Open questions left for the design discussion:
+
+1. Sign-only mode in core `miden-client` vs. separate `miden-agentic-client` crate
+2. Extending OZ Guardian vs. separate `agentic-guardian` component
+3. Where pending-state tracking primarily lives (client, Guardian, or duplicated)
+4. Batch trigger (time window, size threshold, hybrid) and target latency-to-finality
+5. WAL persistence design for nullifier reservations
+6. How Digine-Labs' [miden-x402](https://github.com/Digine-Labs/miden-x402) scheme spec gets updated to express the new flow (likely a new variant alongside `noteType: "private"`)
+
+The actor-model concerns raised in my [earlier follow-up](https://github.com/0xMiden/protocol/discussions/2919#discussioncomment-16976558) are resolved by the Guardian being the single serialization authority, as Bobbin explained. The `AgentDebitNote` proposal is withdrawn, sorry @partylikeits1983 
