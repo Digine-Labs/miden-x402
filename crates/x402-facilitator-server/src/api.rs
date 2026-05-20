@@ -20,9 +20,12 @@ use crate::types::{
 use base64::Engine;
 use guardian_shared::{ProposalSignature, SignatureScheme};
 use miden_protocol::Hasher;
+use miden_protocol::account::AccountId;
 use miden_protocol::crypto::dsa::falcon512_poseidon2::{PublicKey, Signature as FalconSignature};
-use miden_protocol::transaction::{ToInputNoteCommitments, TransactionSummary};
+use miden_protocol::note::Nullifier;
+use miden_protocol::transaction::{RawOutputNote, ToInputNoteCommitments, TransactionSummary};
 use miden_protocol::utils::serde::Deserializable;
+use miden_standards::note::{P2idNote, P2idNoteStorage};
 
 pub fn router(state: AppState) -> Router {
     Router::new()
@@ -199,21 +202,15 @@ async fn post_payment(
         ));
     }
 
-    // 5. Compute dedup keys. In real-Miden mode we always have the
-    //    summary's intrinsic commitment available as a unique
-    //    identifier — for vault-to-output P2ID txs there are no
-    //    input-note nullifiers, so we use the summary commitment.
-    //    Where there ARE input nullifiers (note-consuming txs), we
-    //    track those too. Placeholder mode keeps the client-supplied
-    //    list.
+    // 5. Compute output nullifiers. Real-Miden mode pulls real
+    //    chain-visible nullifiers off the summary (input-note
+    //    nullifiers + output-note nullifiers computed via
+    //    `Nullifier::new`). For a vault-spend P2ID payment this
+    //    yields exactly one nullifier — the future-spend-blocker
+    //    of the P2ID note bound to the merchant. Placeholder mode
+    //    keeps the client-supplied list.
     let nullifiers: Vec<String> = match &extracted_summary {
-        Some(summary) => {
-            let mut keys = extract_nullifier_hexes(summary);
-            if keys.is_empty() {
-                keys.push(crate::key::word_to_hex(summary.to_commitment()));
-            }
-            keys
-        }
+        Some(summary) => extract_nullifier_hexes(summary),
         None => payload.claimed_nullifiers.clone(),
     };
     if nullifiers.is_empty() {
@@ -476,26 +473,53 @@ fn try_decode_real_summary(tx_summary: &serde_json::Value) -> Result<Option<Tran
     Ok(Some(summary))
 }
 
+/// DESIGN.md Step 5: compute every nullifier this tx will reveal /
+/// produce on-chain. Two sources:
+///   - Input-note nullifiers (consumed notes; revealed when this tx
+///     lands on-chain).
+///   - Output-note nullifiers (the future-spend-blocker the recipient
+///     will reveal when consuming the new note). For a vault-spend
+///     P2ID payment this is the single nullifier the design talks
+///     about.
 fn extract_nullifier_hexes(summary: &TransactionSummary) -> Vec<String> {
-    summary
-        .input_notes()
-        .iter()
-        .map(|n| format!("0x{}", hex::encode(n.nullifier().as_bytes())))
-        .collect()
+    let mut out = Vec::new();
+    for n in summary.input_notes().iter() {
+        out.push(format!("0x{}", hex::encode(n.nullifier().as_bytes())));
+    }
+    for raw in summary.output_notes().iter() {
+        if let RawOutputNote::Full(note) = raw {
+            let nullifier = Nullifier::new(
+                note.recipient().script().root(),
+                note.recipient().storage().commitment(),
+                note.assets().commitment(),
+                note.recipient().serial_num(),
+            );
+            out.push(format!("0x{}", hex::encode(nullifier.as_bytes())));
+        }
+    }
+    out
 }
 
-/// Confirm the real summary's output notes look like a P2ID note to
-/// the merchant we negotiated with. v1 enforces:
-///   - Exactly one output note.
-///   - Its sender matches the agent's registered account_id.
-///   - Note metadata's "recipient" tag intent is preserved (we cross-
-///     check via the `expected_output_recipients` carried by the
-///     `TransactionRequest`, which is reflected in the output_notes
-///     section of the summary).
+/// DESIGN.md Step 3: confirm the tx output is a P2ID note paying the
+/// merchant the negotiated asset+amount.
 ///
-/// We intentionally don't try to decode the note script — that's
-/// proven by the chain. We just verify the sender + recipient binding.
-fn validate_p2id_output(summary: &TransactionSummary, _payload: &AgenticPayload) -> Result<()> {
+/// Five clauses, in order:
+///   1. Exactly one output note.
+///   2. The output note must be `RawOutputNote::Full` (i.e. the agent
+///      built it with the full body via `own_output_notes(...)`).
+///   3. Its script root must equal `P2idNote::script_root()` — proves
+///      this is a P2ID note, not some other shape.
+///   4. The recipient `AccountId` encoded in the P2ID note's storage
+///      must equal `x402_context.merchant_account_id`.
+///   5. The note must carry exactly one fungible asset whose
+///      `faucet_id` and `amount` match `x402_context.asset_faucet_id`
+///      and `x402_context.amount`.
+///
+/// Any clause failing returns `OutputCheckFailed` with a specific
+/// message; structurally-bad context strings (hex parse, u64 parse)
+/// return `Malformed`.
+fn validate_p2id_output(summary: &TransactionSummary, payload: &AgenticPayload) -> Result<()> {
+    // 1. Exactly one output note.
     let outputs = summary.output_notes();
     if outputs.num_notes() != 1 {
         return Err(FacilitatorError::OutputCheckFailed(format!(
@@ -503,6 +527,78 @@ fn validate_p2id_output(summary: &TransactionSummary, _payload: &AgenticPayload)
             outputs.num_notes()
         )));
     }
+
+    // 2. Output note must be Full (carries recipient + storage + assets).
+    let raw = outputs
+        .iter()
+        .next()
+        .ok_or_else(|| FacilitatorError::OutputCheckFailed("no output note".into()))?;
+    let note = match raw {
+        RawOutputNote::Full(n) => n,
+        _ => {
+            return Err(FacilitatorError::OutputCheckFailed(
+                "output note must be Full (RawOutputNote::Partial not accepted)".into(),
+            ));
+        }
+    };
+
+    // 3. P2ID script-root match.
+    let actual_script_root = note.recipient().script().root();
+    let expected_script_root = P2idNote::script_root();
+    if actual_script_root != expected_script_root {
+        return Err(FacilitatorError::OutputCheckFailed(format!(
+            "not a P2ID note: script root {:?} != P2ID script root {:?}",
+            actual_script_root, expected_script_root
+        )));
+    }
+
+    // 4. Recipient AccountId must match the merchant from x402 context.
+    let storage_elements = note.recipient().storage().to_elements();
+    let p2id_storage = P2idNoteStorage::try_from(storage_elements.as_slice()).map_err(|e| {
+        FacilitatorError::OutputCheckFailed(format!("P2idNoteStorage parse: {e}"))
+    })?;
+    let actual_recipient = p2id_storage.target();
+    let expected_recipient = AccountId::from_hex(&payload.x402_context.merchant_account_id)
+        .map_err(|e| {
+            FacilitatorError::Malformed(format!("x402_context.merchant_account_id: {e}"))
+        })?;
+    if actual_recipient != expected_recipient {
+        return Err(FacilitatorError::OutputCheckFailed(format!(
+            "recipient {actual_recipient} != merchant {expected_recipient}"
+        )));
+    }
+
+    // 5. Exactly one fungible asset matching faucet + amount.
+    let assets: Vec<_> = note.assets().iter_fungible().collect();
+    if assets.len() != 1 {
+        return Err(FacilitatorError::OutputCheckFailed(format!(
+            "expected exactly 1 fungible asset, found {}",
+            assets.len()
+        )));
+    }
+    let asset = assets[0];
+    let expected_faucet = AccountId::from_hex(&payload.x402_context.asset_faucet_id)
+        .map_err(|e| FacilitatorError::Malformed(format!("x402_context.asset_faucet_id: {e}")))?;
+    let expected_amount: u64 = payload
+        .x402_context
+        .amount
+        .parse()
+        .map_err(|_| FacilitatorError::Malformed("x402_context.amount must be u64".into()))?;
+    if asset.faucet_id() != expected_faucet {
+        return Err(FacilitatorError::OutputCheckFailed(format!(
+            "asset faucet {} != expected {}",
+            asset.faucet_id(),
+            expected_faucet
+        )));
+    }
+    if asset.amount() != expected_amount {
+        return Err(FacilitatorError::OutputCheckFailed(format!(
+            "asset amount {} != expected {}",
+            asset.amount(),
+            expected_amount
+        )));
+    }
+
     Ok(())
 }
 
